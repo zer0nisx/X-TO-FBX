@@ -795,12 +795,16 @@ bool XFileDecompressor::TryLZ77Decompression(const std::vector<uint8_t>& data,
                 uint16_t distance = (lengthDistance >> 4) + 1;
                 uint16_t length = (lengthDistance & 0x0F) + 3;
 
-                if (distance > output.size()) continue;
+                if (distance > output.size()) {
+                    logger_.Warning("DirectX LZ: Invalid distance reference");
+                    break;
+                }
 
-                size_t startPos = output.size() - distance;
+                // Copy from the sliding window
+                size_t copyStart = output.size() - distance;
                 for (int i = 0; i < length; ++i) {
-                    if (startPos + i < output.size()) {
-                        output.push_back(output[startPos + i]);
+                    if (copyStart + (i % distance) < output.size()) {
+                        output.push_back(output[copyStart + (i % distance)]);
                     }
                 }
             }
@@ -936,30 +940,22 @@ bool XFileDecompressor::DecompressDirectXLZ(const std::vector<uint8_t>& input,
             // Process 8 bits in the flag byte
             for (int bit = 0; bit < 8 && inputPos < input.size(); ++bit) {
                 if (flag & (1 << bit)) {
-                    // Literal byte
-                    if (inputPos < input.size()) {
-                        output.push_back(data[inputPos++]);
-                    }
+                    // Literal
+                    output.push_back(data[inputPos++]);
                 } else {
-                    // Length-distance pair
+                    // Match
                     if (inputPos + 1 >= input.size()) break;
 
-                    uint16_t lenDist = (data[inputPos + 1] << 8) | data[inputPos];
+                    uint16_t match = data[inputPos] | (data[inputPos + 1] << 8);
                     inputPos += 2;
 
-                    int distance = (lenDist >> 4) + 1;
-                    int length = (lenDist & 0xF) + 3;
+                    int offset = (match >> 4) + 1;
+                    int length = (match & 0x0F) + 3;
 
-                    if (distance > output.size()) {
-                        logger_.Warning("DirectX LZ: Invalid distance reference");
-                        break;
-                    }
-
-                    // Copy from the sliding window
-                    size_t copyStart = output.size() - distance;
-                    for (int i = 0; i < length; ++i) {
-                        if (copyStart + (i % distance) < output.size()) {
-                            output.push_back(output[copyStart + (i % distance)]);
+                    if (offset <= output.size()) {
+                        size_t start = output.size() - offset;
+                        for (int j = 0; j < length; ++j) {
+                            output.push_back(output[start + (j % offset)]);
                         }
                     }
                 }
@@ -1335,6 +1331,85 @@ bool BinaryXFileParser::ParseCompressedFile(const std::string& filepath) {
     }
 
     logger_.Info("Successfully decompressed data, size: " + std::to_string(decompressedData.size()) + " bytes");
+
+    // Better analysis of decompressed content before trying to parse it as X-file
+    std::string start(reinterpret_cast<const char*>(decompressedData.data()),
+                     std::min<size_t>(32, decompressedData.size()));
+    logger_.Info("Decompressed data starts with: '" + start + "'");
+
+    // Log more detailed information about the decompressed content
+    std::string hexStart;
+    for (size_t i = 0; i < std::min<size_t>(32, decompressedData.size()); ++i) {
+        char hex[3];
+        sprintf(hex, "%02X", decompressedData[i]);
+        hexStart += hex;
+        if (i < 31) hexStart += " ";
+    }
+    logger_.Info("Decompressed content (first 32 bytes hex): " + hexStart);
+
+    // Try to find valid X-file signatures within the decompressed data
+    bool foundXofSignature = false;
+    size_t xofOffset = 0;
+
+    // Search for "xof " signature in the decompressed data
+    for (size_t i = 0; i <= decompressedData.size() - 4; ++i) {
+        if (decompressedData[i] == 'x' && decompressedData[i+1] == 'o' &&
+            decompressedData[i+2] == 'f' && decompressedData[i+3] == ' ') {
+            foundXofSignature = true;
+            xofOffset = i;
+            logger_.Info("Found 'xof ' signature at offset " + std::to_string(i) + " in decompressed data");
+            break;
+        }
+    }
+
+    if (foundXofSignature && xofOffset > 0) {
+        // Extract the X-file content starting from the xof signature
+        std::vector<uint8_t> xfileContent(decompressedData.begin() + xofOffset, decompressedData.end());
+        logger_.Info("Extracting X-file content from offset " + std::to_string(xofOffset) +
+                   ", new size: " + std::to_string(xfileContent.size()) + " bytes");
+
+        std::string xfileStart(reinterpret_cast<const char*>(xfileContent.data()),
+                             std::min<size_t>(64, xfileContent.size()));
+        logger_.Info("X-file content starts with: '" + xfileStart + "'");
+
+        return ParseBinaryData(xfileContent);
+    }
+
+    // If no xof signature found, try to interpret as binary X-file
+    if (!foundXofSignature) {
+        logger_.Info("No 'xof ' signature found, checking for binary X-file format...");
+
+        // Check for binary X-file header patterns
+        if (decompressedData.size() >= 16) {
+            // Try different interpretations of the binary data
+            // Method 1: Try skipping potential metadata at the beginning
+            for (size_t skip = 0; skip < std::min<size_t>(256, decompressedData.size() - 16); skip += 4) {
+                std::vector<uint8_t> skippedData(decompressedData.begin() + skip, decompressedData.end());
+
+                // Check if this looks like X-file content
+                if (skippedData.size() >= 4) {
+                    std::string testStart(reinterpret_cast<const char*>(skippedData.data()),
+                                        std::min<size_t>(16, skippedData.size()));
+
+                    if (testStart.find("xof") == 0 || testStart.find("template") != std::string::npos) {
+                        logger_.Info("Found potential X-file content at offset " + std::to_string(skip));
+                        logger_.Info("Content: '" + testStart + "'");
+                        return ParseBinaryData(skippedData);
+                    }
+                }
+            }
+        }
+
+        // Method 2: Try to save decompressed data to file for manual inspection
+        logger_.Info("Saving decompressed data to 'decompressed_debug.bin' for analysis");
+        std::ofstream debugFile("decompressed_debug.bin", std::ios::binary);
+        if (debugFile.is_open()) {
+            debugFile.write(reinterpret_cast<const char*>(decompressedData.data()), decompressedData.size());
+            debugFile.close();
+            logger_.Info("Decompressed data saved to decompressed_debug.bin");
+        }
+    }
+
     return ParseBinaryData(decompressedData);
 }
 
