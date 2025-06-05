@@ -77,6 +77,8 @@ public:
                               std::vector<uint8_t>& output);
     bool DecompressDirectXLZ(const std::vector<uint8_t>& input,
                             std::vector<uint8_t>& output);
+    bool DecompressBzip0032(const std::vector<uint8_t>& input,
+                           std::vector<uint8_t>& output);
 
     // Detection
     bool IsZipCompressed(const std::vector<uint8_t>& data);
@@ -91,6 +93,20 @@ private:
                            std::vector<uint8_t>& output);
     bool DecompressWithBzip2(const std::vector<uint8_t>& input,
                             std::vector<uint8_t>& output);
+
+    // New helper methods for bzip0032 format
+    bool TryMultipleDecompressionMethods(const std::vector<uint8_t>& data,
+                                       std::vector<uint8_t>& output);
+    bool TryZlibDecompression(const std::vector<uint8_t>& data,
+                            std::vector<uint8_t>& output);
+    bool TryDeflateWithParams(const std::vector<uint8_t>& data,
+                            std::vector<uint8_t>& output,
+                            size_t offset, int windowBits);
+    bool TryLZ77Decompression(const std::vector<uint8_t>& data,
+                            std::vector<uint8_t>& output);
+    bool TryPatternBasedDecompression(const std::vector<uint8_t>& data,
+                                   std::vector<uint8_t>& output);
+    bool ValidateDecompressedContent(const std::vector<uint8_t>& data);
 };
 
 // Binary .x file parser

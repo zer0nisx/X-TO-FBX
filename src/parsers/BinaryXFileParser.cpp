@@ -584,6 +584,317 @@ bool XFileDecompressor::DecompressDirectXBzip(const std::vector<uint8_t>& input,
 #endif
 }
 
+bool XFileDecompressor::DecompressBzip0032(const std::vector<uint8_t>& input,
+                                           std::vector<uint8_t>& output) {
+    logger_.Info("Attempting specialized bzip0032 DirectX format decompression");
+
+    if (input.size() < 16) {
+        logger_.Error("bzip0032: Input too small for DirectX bzip0032 format");
+        return false;
+    }
+
+    // Log detailed header analysis
+    std::string hexHeader;
+    for (size_t i = 0; i < std::min<size_t>(32, input.size()); ++i) {
+        char hex[3];
+        sprintf(hex, "%02X", input[i]);
+        hexHeader += hex;
+        if (i < 31) hexHeader += " ";
+    }
+    logger_.Info("Full header (32 bytes): " + hexHeader);
+
+    // DirectX bzip0032 specific analysis
+    // The format seems to be: "xof 0303bzip0032" + compressed data
+    const std::string expectedHeader = "xof 0303bzip0032";
+
+    if (input.size() >= expectedHeader.length()) {
+        std::string fileHeader(reinterpret_cast<const char*>(input.data()), expectedHeader.length());
+        if (fileHeader == expectedHeader) {
+            logger_.Info("Confirmed bzip0032 format header");
+
+            // Skip the header and try to decompress the remaining data
+            size_t dataOffset = expectedHeader.length();
+            std::vector<uint8_t> compressedData(input.begin() + dataOffset, input.end());
+
+            logger_.Info("Attempting decompression of " + std::to_string(compressedData.size()) + " bytes after header");
+
+            // Try multiple decompression strategies for the data after header
+            return TryMultipleDecompressionMethods(compressedData, output);
+        }
+    }
+
+    // If header doesn't match exactly, try with different offsets
+    logger_.Info("Header doesn't match exactly, trying with offsets...");
+
+    for (size_t offset = 16; offset <= 32 && offset < input.size(); offset += 4) {
+        std::vector<uint8_t> dataFromOffset(input.begin() + offset, input.end());
+        if (TryMultipleDecompressionMethods(dataFromOffset, output)) {
+            logger_.Info("Successfully decompressed data starting from offset " + std::to_string(offset));
+            return true;
+        }
+    }
+
+    logger_.Warning("bzip0032: All specialized decompression attempts failed");
+    return false;
+}
+
+bool XFileDecompressor::TryMultipleDecompressionMethods(const std::vector<uint8_t>& data,
+                                                       std::vector<uint8_t>& output) {
+#ifdef HAVE_ZLIB
+    if (data.empty()) return false;
+
+    // Method 1: Try to detect if this might be zlib/deflate with custom wrapper
+    logger_.Info("Trying enhanced deflate detection...");
+
+    // Check for zlib header (0x78xx)
+    if (data.size() >= 2 && data[0] == 0x78) {
+        logger_.Info("Possible zlib header detected (0x78xx)");
+        if (TryZlibDecompression(data, output)) {
+            return true;
+        }
+    }
+
+    // Method 2: Try raw deflate with all possible window sizes and offsets
+    std::vector<int> windowSizes = {-15, -14, -13, -12, -11, -10, 15, 14, 13, 12, 11, 10, 9, 8};
+    std::vector<size_t> offsets = {0, 1, 2, 3, 4, 8, 12, 16};
+
+    for (size_t offset : offsets) {
+        if (offset >= data.size()) continue;
+
+        for (int windowBits : windowSizes) {
+            if (TryDeflateWithParams(data, output, offset, windowBits)) {
+                logger_.Info("Success with offset " + std::to_string(offset) +
+                           " and window bits " + std::to_string(windowBits));
+                return true;
+            }
+        }
+    }
+
+    // Method 3: Try to interpret as LZ77 variant
+    logger_.Info("Trying LZ77 variant decompression...");
+    if (TryLZ77Decompression(data, output)) {
+        return true;
+    }
+
+    // Method 4: Try reverse engineering approach - look for patterns
+    logger_.Info("Trying pattern-based decompression...");
+    if (TryPatternBasedDecompression(data, output)) {
+        return true;
+    }
+
+#endif
+    return false;
+}
+
+bool XFileDecompressor::TryZlibDecompression(const std::vector<uint8_t>& data,
+                                            std::vector<uint8_t>& output) {
+#ifdef HAVE_ZLIB
+    z_stream zStream;
+    memset(&zStream, 0, sizeof(zStream));
+
+    zStream.next_in = const_cast<Bytef*>(data.data());
+    zStream.avail_in = static_cast<uInt>(data.size());
+
+    int result = inflateInit(&zStream);
+    if (result != Z_OK) {
+        return false;
+    }
+
+    size_t outputSize = data.size() * 20; // Try larger expansion
+    output.resize(outputSize);
+
+    zStream.next_out = output.data();
+    zStream.avail_out = static_cast<uInt>(outputSize);
+
+    result = inflate(&zStream, Z_FINISH);
+
+    if (result == Z_STREAM_END) {
+        output.resize(zStream.total_out);
+        inflateEnd(&zStream);
+
+        // Validate the output
+        if (ValidateDecompressedContent(output)) {
+            logger_.Info("zlib decompression successful! Decompressed " +
+                        std::to_string(output.size()) + " bytes");
+            return true;
+        }
+    }
+
+    inflateEnd(&zStream);
+#endif
+    return false;
+}
+
+bool XFileDecompressor::TryDeflateWithParams(const std::vector<uint8_t>& data,
+                                            std::vector<uint8_t>& output,
+                                            size_t offset, int windowBits) {
+#ifdef HAVE_ZLIB
+    if (offset >= data.size()) return false;
+
+    z_stream zStream;
+    memset(&zStream, 0, sizeof(zStream));
+
+    zStream.next_in = const_cast<Bytef*>(data.data() + offset);
+    zStream.avail_in = static_cast<uInt>(data.size() - offset);
+
+    int result = inflateInit2(&zStream, windowBits);
+    if (result != Z_OK) {
+        return false;
+    }
+
+    size_t outputSize = (data.size() - offset) * 15; // Even larger expansion
+    output.resize(outputSize);
+
+    zStream.next_out = output.data();
+    zStream.avail_out = static_cast<uInt>(outputSize);
+
+    result = inflate(&zStream, Z_FINISH);
+
+    if (result == Z_STREAM_END) {
+        output.resize(zStream.total_out);
+        inflateEnd(&zStream);
+
+        if (ValidateDecompressedContent(output)) {
+            return true;
+        }
+    }
+
+    inflateEnd(&zStream);
+#endif
+    return false;
+}
+
+bool XFileDecompressor::TryLZ77Decompression(const std::vector<uint8_t>& data,
+                                            std::vector<uint8_t>& output) {
+    // Simple LZ77 decompression attempt
+    // This is a basic implementation for DirectX-style LZ compression
+
+    if (data.size() < 4) return false;
+
+    output.clear();
+    output.reserve(data.size() * 10);
+
+    size_t pos = 0;
+
+    while (pos < data.size()) {
+        uint8_t control = data[pos++];
+
+        for (int bit = 0; bit < 8 && pos < data.size(); ++bit) {
+            if (control & (1 << bit)) {
+                // Literal byte
+                if (pos < data.size()) {
+                    output.push_back(data[pos++]);
+                }
+            } else {
+                // Length-distance pair
+                if (pos + 1 >= data.size()) break;
+
+                uint16_t lengthDistance = (data[pos + 1] << 8) | data[pos];
+                pos += 2;
+
+                uint16_t distance = (lengthDistance >> 4) + 1;
+                uint16_t length = (lengthDistance & 0x0F) + 3;
+
+                if (distance > output.size()) continue;
+
+                size_t startPos = output.size() - distance;
+                for (int i = 0; i < length; ++i) {
+                    if (startPos + i < output.size()) {
+                        output.push_back(output[startPos + i]);
+                    }
+                }
+            }
+        }
+    }
+
+    if (ValidateDecompressedContent(output)) {
+        logger_.Info("LZ77 decompression successful! Decompressed " +
+                    std::to_string(output.size()) + " bytes");
+        return true;
+    }
+
+    return false;
+}
+
+bool XFileDecompressor::TryPatternBasedDecompression(const std::vector<uint8_t>& data,
+                                                   std::vector<uint8_t>& output) {
+    // Look for embedded X-file content or patterns
+
+    // Search for "xof" pattern within the data
+    for (size_t i = 0; i < data.size() - 3; ++i) {
+        if (data[i] == 'x' && data[i+1] == 'o' && data[i+2] == 'f' && data[i+3] == ' ') {
+            logger_.Info("Found embedded 'xof ' pattern at offset " + std::to_string(i));
+
+            // Try to extract data from this point
+            output.assign(data.begin() + i, data.end());
+
+            if (ValidateDecompressedContent(output)) {
+                logger_.Info("Pattern-based extraction successful!");
+                return true;
+            }
+        }
+    }
+
+    // Try to find template patterns
+    const std::string templatePattern = "template";
+    for (size_t i = 0; i <= data.size() - templatePattern.length(); ++i) {
+        if (std::memcmp(data.data() + i, templatePattern.c_str(), templatePattern.length()) == 0) {
+            logger_.Info("Found 'template' pattern at offset " + std::to_string(i));
+
+            // Extract from the beginning or from this point
+            if (i > 0) {
+                // Try from beginning with this as validation
+                output.assign(data.begin(), data.end());
+            } else {
+                output.assign(data.begin() + i, data.end());
+            }
+
+            if (ValidateDecompressedContent(output)) {
+                logger_.Info("Template pattern extraction successful!");
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool XFileDecompressor::ValidateDecompressedContent(const std::vector<uint8_t>& data) {
+    if (data.empty()) return false;
+
+    // Check for X-file signatures
+    std::string start(reinterpret_cast<const char*>(data.data()),
+                     std::min<size_t>(16, data.size()));
+
+    logger_.Info("Validating decompressed content, starts with: '" + start + "'");
+
+    // Valid X-file should start with "xof " or contain "template"
+    if (start.find("xof ") == 0) {
+        logger_.Info("Valid X-file header found");
+        return true;
+    }
+
+    if (data.size() > 100) {
+        std::string larger(reinterpret_cast<const char*>(data.data()),
+                          std::min<size_t>(100, data.size()));
+        if (larger.find("template") != std::string::npos) {
+            logger_.Info("X-file template found in content");
+            return true;
+        }
+    }
+
+    // Check for binary X-file signature
+    if (data.size() >= 4) {
+        if ((data[0] == 'x' && data[1] == 'o' && data[2] == 'f' && data[3] == ' ') ||
+            (data[0] == 0x78 && data[1] == 0x6f && data[2] == 0x66 && data[3] == 0x20)) {
+            logger_.Info("Binary X-file signature detected");
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Add new method to handle Microsoft LZ compression (commonly used in DirectX)
 bool XFileDecompressor::DecompressDirectXLZ(const std::vector<uint8_t>& input,
                                            std::vector<uint8_t>& output) {
@@ -888,12 +1199,20 @@ bool BinaryXFileParser::ParseCompressedFile(const std::string& filepath) {
                     // This may be a DirectX proprietary compression format, not standard bzip2
                     logger_.Warning("Standard bzip2 signature not found - this may be DirectX proprietary compression");
 
-                    // Try DirectX-specific bzip decompression first
+                    // Try DirectX-specific bzip0032 decompression first
                     logger_.Info("Attempting DirectX proprietary bzip0032 decompression...");
+
+                    // Use the specialized bzip0032 method with the full data including header
+                    if (decompressor.DecompressBzip0032(data, decompressedData)) {
+                        logger_.Info("Successfully decompressed using specialized bzip0032 method!");
+                        return ParseBinaryData(decompressedData);
+                    }
+
+                    // Fallback to original method with payload only
                     if (data.size() > 16) {
                         std::vector<uint8_t> compressedPayload(data.begin() + 16, data.end());
                         if (decompressor.DecompressDirectXBzip(compressedPayload, decompressedData)) {
-                            logger_.Info("Successfully decompressed using DirectX bzip method!");
+                            logger_.Info("Successfully decompressed using fallback DirectX bzip method!");
                             return ParseBinaryData(decompressedData);
                         }
 
